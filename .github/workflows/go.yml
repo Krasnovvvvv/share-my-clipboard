@@ -12,9 +12,11 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Update apt
+      run: sudo apt-get update
+
     - name: Install X11 and other dependencies
-      run: sudo apt-get update && sudo apt-get install -y \
-        libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev libgl1-mesa-dev libxxf86vm-dev
+      run: sudo apt-get install -y xorg-dev libgl1-mesa-dev
 
     - name: Set up Go
       uses: actions/setup-go@v4
@@ -26,4 +28,5 @@ jobs:
 
     - name: Test
       run: go test -v ./...
+
 
