@@ -29,6 +29,9 @@ func main() {
 		status,
 	)
 
+	r, _ := fyne.LoadResourceFromPath("Icons/main_icon.jpg")
+	w.SetIcon(r)
+
 	w.SetContent(content)
 	w.ShowAndRun()
 }
