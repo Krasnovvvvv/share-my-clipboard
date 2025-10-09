@@ -2,6 +2,8 @@ package main
 
 import (
 	"strconv"
+	"sync"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -9,6 +11,8 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+
+	"github.com/schollz/peerdiscovery"
 )
 
 type Device struct {
@@ -16,25 +20,24 @@ type Device struct {
 	IP   string
 }
 
+// thread safe devices
+var (
+	devices   = []Device{}
+	devicesMu sync.RWMutex
+)
+
 func main() {
 	a := app.NewWithID("com.krasnov.clipboard")
 	a.Settings().SetTheme(theme.DarkTheme())
 	w := a.NewWindow("Share My Clipboard")
-	w.Resize(fyne.NewSize(440, 480))
+	w.Resize(fyne.NewSize(440, 530))
 
-	devices := []Device{
-		{"ПК", "192.168.0.2"},
-		{"Lenovo", "192.168.0.29"},
-		{"Redmi", "192.168.0.17"},
-		{"Стационарник", "192.168.0.4"},
-		{"Рабочий ПК", "192.168.0.100"},
-		{"MacBook", "192.168.0.31"},
-		{"Tablet", "192.168.0.9"},
-	}
 	page := 0
 	const pageSize = 4
 
 	getPage := func() []Device {
+		devicesMu.RLock()
+		defer devicesMu.RUnlock()
 		start := page * pageSize
 		end := start + pageSize
 		if end > len(devices) {
@@ -43,7 +46,6 @@ func main() {
 		return devices[start:end]
 	}
 
-	// Одиночная карточка
 	makeDeviceCard := func(d Device) fyne.CanvasObject {
 		return container.NewVBox(
 			container.NewCenter(widget.NewIcon(theme.ComputerIcon())),
@@ -60,10 +62,14 @@ func main() {
 		for _, d := range getPage() {
 			frame := widget.NewCard(
 				"", "", makeDeviceCard(d))
-			frame.Resize(fyne.NewSize(260, 80)) // фикс. ширина и высота
+			frame.Resize(fyne.NewSize(260, 80))
 			cardsBox.Add(container.NewCenter(frame))
 		}
-		pageLabel.SetText("Стр. " + strconv.Itoa(page+1) + " / " + strconv.Itoa((len(devices)+pageSize-1)/pageSize))
+		totalPages := (len(devices) + pageSize - 1) / pageSize
+		if totalPages == 0 {
+			totalPages = 1
+		}
+		pageLabel.SetText("Стр. " + strconv.Itoa(page+1) + " / " + strconv.Itoa(totalPages))
 		cardsBox.Refresh()
 	}
 
@@ -74,26 +80,55 @@ func main() {
 		}
 	})
 	nextBtn := widget.NewButtonWithIcon("Вперед", theme.NavigateNextIcon(), func() {
-		if (page+1)*pageSize < len(devices) {
+		devicesMu.RLock()
+		maxPage := (len(devices) - 1) / pageSize
+		devicesMu.RUnlock()
+		if (page + 1) <= maxPage {
 			page++
 			update()
 		}
 	})
 
-	update()
+	// discovery background worker
+	go func() {
+		for {
+			discoveries, _ := peerdiscovery.Discover(peerdiscovery.Settings{
+				Limit:     -1,
+				Payload:   []byte("clipboard"),
+				Port:      "8877",
+				TimeLimit: 2 * time.Second,
+			})
+
+			found := []Device{}
+			for _, d := range discoveries {
+				found = append(found, Device{
+					Name: "Clipboard Device", // Можно потом добавить передачу имени
+					IP:   d.Address,
+				})
+			}
+			devicesMu.Lock()
+			devices = found
+			devicesMu.Unlock()
+			// обновляем UI
+			fyne.CurrentApp().SendNotification(&fyne.Notification{
+				Title:   "Network scan",
+				Content: "Обновлен список устройств!",
+			})
+			time.Sleep(4 * time.Second)
+		}
+	}()
 
 	deviceListCard := widget.NewCard("Устройства в сети", "",
 		container.NewVBox(
-			layout.NewSpacer(), // небольшой вертикальный отступ сверху
+			layout.NewSpacer(),
 			container.NewCenter(cardsBox),
-			layout.NewSpacer(), // отступ снизу,
+			layout.NewSpacer(),
 		),
 	)
-	deviceListCard.Resize(fyne.NewSize(300, 450)) // фиксированная ширина списка
+	deviceListCard.Resize(fyne.NewSize(300, 450))
 
 	content := container.NewVBox(
 		container.NewCenter(widget.NewLabelWithStyle("Share My Clipboard", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})),
-		container.NewCenter(widget.NewLabel("Кроссплатформенный обмен буфером обмена")),
 		widget.NewSeparator(),
 		container.NewCenter(deviceListCard),
 		container.NewCenter(
@@ -102,6 +137,16 @@ func main() {
 			),
 		),
 	)
+
+	// переодически обновлять UI
+	go func() {
+		for {
+			fyne.Do(func() {
+				update()
+			})
+			time.Sleep(2 * time.Second)
+		}
+	}()
 
 	r, _ := fyne.LoadResourceFromPath("Icons/main_icon.jpg")
 	w.SetIcon(r)
