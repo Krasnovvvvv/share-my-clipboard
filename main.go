@@ -61,9 +61,10 @@ func main() {
 	update := func() {
 		cardsBox.Objects = nil
 		for _, d := range getPage() {
-			frame := widget.NewCard("", "", makeDeviceCard(d))
-			frame.Resize(fyne.NewSize(260, 80))
-			cardsBox.Add(container.NewCenter(frame))
+			card := makeDeviceCard(d)
+			cardContainer := container.NewCenter(container.NewVBox(card))
+			cardContainer.Resize(fyne.NewSize(260, 80))
+			cardsBox.Add(cardContainer)
 		}
 		totalPages := (len(devices) + pageSize - 1) / pageSize
 		if totalPages == 0 {
@@ -89,19 +90,21 @@ func main() {
 		}
 	})
 
-	deviceListCard := widget.NewCard("Устройства в сети", "",
-		container.NewVBox(
-			layout.NewSpacer(),
-			container.NewCenter(cardsBox),
-			layout.NewSpacer(),
-		),
+	// убрана рамка вокруг заголовка блока
+	title := widget.NewLabelWithStyle("Устройства в сети", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	deviceListContainer := container.NewVBox(
+		layout.NewSpacer(),
+		container.NewCenter(title),
+		layout.NewSpacer(),
+		container.NewCenter(cardsBox),
+		layout.NewSpacer(),
 	)
-	deviceListCard.Resize(fyne.NewSize(300, 450))
+	deviceListContainer.Resize(fyne.NewSize(300, 450))
 
 	content := container.NewVBox(
 		container.NewCenter(widget.NewLabelWithStyle("Share My Clipboard", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})),
 		widget.NewSeparator(),
-		container.NewCenter(deviceListCard),
+		container.NewCenter(deviceListContainer),
 		container.NewCenter(
 			container.NewHBox(
 				prevBtn, layout.NewSpacer(), pageLabel, layout.NewSpacer(), nextBtn,
