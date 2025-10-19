@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"reflect"
 	"strconv"
 	"sync"
 	"time"
@@ -20,7 +22,6 @@ type Device struct {
 	IP   string
 }
 
-// thread safe devices
 var (
 	devices   = []Device{}
 	devicesMu sync.RWMutex
@@ -60,8 +61,7 @@ func main() {
 	update := func() {
 		cardsBox.Objects = nil
 		for _, d := range getPage() {
-			frame := widget.NewCard(
-				"", "", makeDeviceCard(d))
+			frame := widget.NewCard("", "", makeDeviceCard(d))
 			frame.Resize(fyne.NewSize(260, 80))
 			cardsBox.Add(container.NewCenter(frame))
 		}
@@ -89,35 +89,6 @@ func main() {
 		}
 	})
 
-	// discovery background worker
-	go func() {
-		for {
-			discoveries, _ := peerdiscovery.Discover(peerdiscovery.Settings{
-				Limit:     -1,
-				Payload:   []byte("clipboard"),
-				Port:      "8877",
-				TimeLimit: 2 * time.Second,
-			})
-
-			found := []Device{}
-			for _, d := range discoveries {
-				found = append(found, Device{
-					Name: "Clipboard Device", // Можно потом добавить передачу имени
-					IP:   d.Address,
-				})
-			}
-			devicesMu.Lock()
-			devices = found
-			devicesMu.Unlock()
-			// обновляем UI
-			fyne.CurrentApp().SendNotification(&fyne.Notification{
-				Title:   "Network scan",
-				Content: "Обновлен список устройств!",
-			})
-			time.Sleep(4 * time.Second)
-		}
-	}()
-
 	deviceListCard := widget.NewCard("Устройства в сети", "",
 		container.NewVBox(
 			layout.NewSpacer(),
@@ -138,18 +109,55 @@ func main() {
 		),
 	)
 
-	// переодически обновлять UI
+	// Получаем имя устройства автоматически (hostname)
+	hostName, err := os.Hostname()
+	if err != nil {
+		hostName = "Unknown"
+	}
+
+	// Фоновая горутина для поиска устройств
 	go func() {
 		for {
-			fyne.Do(func() {
-				update()
+			discoveries, _ := peerdiscovery.Discover(peerdiscovery.Settings{
+				Limit:     -1,
+				Payload:   []byte(hostName),
+				Port:      "8877",
+				TimeLimit: 2 * time.Second,
 			})
+
+			found := []Device{}
+			for _, d := range discoveries {
+				found = append(found, Device{
+					Name: string(d.Payload),
+					IP:   d.Address,
+				})
+			}
+
+			devicesMu.Lock()
+			changed := !reflect.DeepEqual(devices, found)
+			devices = found
+			devicesMu.Unlock()
+
+			if changed {
+				fyne.CurrentApp().SendNotification(&fyne.Notification{
+					Title:   "Network scan",
+					Content: "Обновлен список устройств!",
+				})
+			}
+
+			time.Sleep(4 * time.Second)
+		}
+	}()
+
+	// Периодическое обновление UI
+	go func() {
+		for {
+			fyne.Do(func() { update() })
 			time.Sleep(2 * time.Second)
 		}
 	}()
 
-	r, _ := fyne.LoadResourceFromPath("Icons/main_icon.jpg")
-	w.SetIcon(r)
+	w.SetIcon(resourceMainiconPng)
 	w.SetContent(content)
 	w.ShowAndRun()
 }

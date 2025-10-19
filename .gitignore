@@ -43,3 +43,4 @@ coverage.out
 
 # Generated files
 gen/
+/resource.syso
