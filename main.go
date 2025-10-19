@@ -9,11 +9,11 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-
 	"github.com/schollz/peerdiscovery"
 )
 
@@ -56,7 +56,7 @@ func main() {
 	}
 
 	cardsBox := container.NewVBox()
-	pageLabel := widget.NewLabel("")
+	pageLabel := widget.NewLabel("Page " + strconv.Itoa(page+1))
 
 	update := func() {
 		cardsBox.Objects = nil
@@ -70,17 +70,17 @@ func main() {
 		if totalPages == 0 {
 			totalPages = 1
 		}
-		pageLabel.SetText("Стр. " + strconv.Itoa(page+1) + " / " + strconv.Itoa(totalPages))
+		pageLabel.SetText("Page " + strconv.Itoa(page+1) + " / " + strconv.Itoa(totalPages))
 		cardsBox.Refresh()
 	}
 
-	prevBtn := widget.NewButtonWithIcon("Назад", theme.NavigateBackIcon(), func() {
+	prevBtn := widget.NewButtonWithIcon("", theme.NavigateBackIcon(), func() {
 		if page > 0 {
 			page--
 			update()
 		}
 	})
-	nextBtn := widget.NewButtonWithIcon("Вперед", theme.NavigateNextIcon(), func() {
+	nextBtn := widget.NewButtonWithIcon("", theme.NavigateNextIcon(), func() {
 		devicesMu.RLock()
 		maxPage := (len(devices) - 1) / pageSize
 		devicesMu.RUnlock()
@@ -90,14 +90,71 @@ func main() {
 		}
 	})
 
-	// убрана рамка вокруг заголовка блока
-	title := widget.NewLabelWithStyle("Устройства в сети", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	hostName, err := os.Hostname()
+	if err != nil {
+		hostName = "Unknown"
+	}
+
+	scanTrigger := make(chan struct{}, 1)
+
+	scanDevices := func() {
+		discoveries, _ := peerdiscovery.Discover(peerdiscovery.Settings{
+			Limit:     -1,
+			Payload:   []byte(hostName),
+			Port:      "8877",
+			TimeLimit: 2 * time.Second,
+		})
+		found := []Device{}
+		for _, d := range discoveries {
+			found = append(found, Device{
+				Name: string(d.Payload),
+				IP:   d.Address,
+			})
+		}
+		devicesMu.Lock()
+		changed := !reflect.DeepEqual(devices, found)
+		devices = found
+		devicesMu.Unlock()
+		if changed {
+			fyne.CurrentApp().SendNotification(&fyne.Notification{
+				Title:   "Network scan",
+				Content: "Device list updated!",
+			})
+		}
+		fyne.Do(func() { update() })
+	}
+
+	marginBefore := canvas.NewRectangle(nil)
+	marginBefore.SetMinSize(fyne.NewSize(0, 5))
+	marginAfter := canvas.NewRectangle(nil)
+	marginAfter.SetMinSize(fyne.NewSize(0, 5))
+
+	updateBtn := widget.NewButtonWithIcon("Update", theme.ViewRefreshIcon(), func() {
+		select {
+		case scanTrigger <- struct{}{}:
+		default:
+		}
+	})
+	updateBtn.Importance = widget.HighImportance
+
+	title := widget.NewLabelWithStyle("Devices on the Network", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+
+	pagination := container.NewHBox(
+		prevBtn,
+		layout.NewSpacer(),
+		pageLabel,
+		layout.NewSpacer(),
+		nextBtn,
+	)
+	paginationCentered := container.NewCenter(pagination)
+
 	deviceListContainer := container.NewVBox(
-		layout.NewSpacer(),
 		container.NewCenter(title),
-		layout.NewSpacer(),
 		container.NewCenter(cardsBox),
-		layout.NewSpacer(),
+		marginBefore,
+		container.NewCenter(updateBtn),
+		marginAfter,
+		paginationCentered,
 	)
 	deviceListContainer.Resize(fyne.NewSize(300, 450))
 
@@ -105,58 +162,15 @@ func main() {
 		container.NewCenter(widget.NewLabelWithStyle("Share My Clipboard", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})),
 		widget.NewSeparator(),
 		container.NewCenter(deviceListContainer),
-		container.NewCenter(
-			container.NewHBox(
-				prevBtn, layout.NewSpacer(), pageLabel, layout.NewSpacer(), nextBtn,
-			),
-		),
 	)
 
-	// Получаем имя устройства автоматически (hostname)
-	hostName, err := os.Hostname()
-	if err != nil {
-		hostName = "Unknown"
-	}
-
-	// Фоновая горутина для поиска устройств
 	go func() {
 		for {
-			discoveries, _ := peerdiscovery.Discover(peerdiscovery.Settings{
-				Limit:     -1,
-				Payload:   []byte(hostName),
-				Port:      "8877",
-				TimeLimit: 2 * time.Second,
-			})
-
-			found := []Device{}
-			for _, d := range discoveries {
-				found = append(found, Device{
-					Name: string(d.Payload),
-					IP:   d.Address,
-				})
+			scanDevices()
+			select {
+			case <-scanTrigger:
+			case <-time.After(4 * time.Second):
 			}
-
-			devicesMu.Lock()
-			changed := !reflect.DeepEqual(devices, found)
-			devices = found
-			devicesMu.Unlock()
-
-			if changed {
-				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:   "Network scan",
-					Content: "Обновлен список устройств!",
-				})
-			}
-
-			time.Sleep(4 * time.Second)
-		}
-	}()
-
-	// Периодическое обновление UI
-	go func() {
-		for {
-			fyne.Do(func() { update() })
-			time.Sleep(2 * time.Second)
 		}
 	}()
 
