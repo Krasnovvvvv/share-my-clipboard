@@ -17,7 +17,6 @@ import (
 	"github.com/Krasnovvvvv/share-my-clipboard/internal/ui"
 )
 
-// getLocalIP автоматически определяет локальный IP-адрес устройства.
 func getLocalIP() string {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
@@ -31,7 +30,6 @@ func getLocalIP() string {
 	return "127.0.0.1"
 }
 
-// Run запускает приложение Share My Clipboard.
 func Run() {
 	a := app.NewWithID("com.krasnov.clipboard")
 	a.Settings().SetTheme(theme.DarkTheme())
@@ -54,21 +52,15 @@ func Run() {
 	}
 	localIP := getLocalIP()
 
-	// предварительное объявление для видимости в замыканиях
 	var updatePage func()
-
-	// функция обновления интерфейса
 	updatePage = func() {
 		devs := ds.GetPage(page, pageSize)
 		cardsBox.Objects = nil
-
 		for _, d := range devs {
 			isConn := connMgr.IsConnected(d.IP)
 			devCopy := d
 			card := container.NewCenter(ui.MakeDeviceCard(
-				d.Name,
-				d.IP,
-				isConn,
+				d.Name, d.IP, isConn,
 				func(ip string) {
 					req := network.ConnectionRequest{
 						FromName: hostName,
@@ -86,12 +78,8 @@ func Run() {
 			))
 			cardsBox.Add(card)
 		}
-
 		total := len(ds.Devices)
-		totalPages := total / pageSize
-		if total%pageSize != 0 {
-			totalPages++
-		}
+		totalPages := (total + pageSize - 1) / pageSize
 		if totalPages == 0 {
 			totalPages = 1
 		}
@@ -99,30 +87,34 @@ func Run() {
 		cardsBox.Refresh()
 	}
 
-	// обработчик входящих запросов
 	connMgr.OnRequest = func(req network.ConnectionRequest) {
 		fyne.Do(func() {
+			updatePage()
 			ui.ConfirmConnection(w, req.FromName, func(approved bool) {
 				resp := network.ConnectionResponse{FromIP: localIP, ToIP: req.FromIP, Accept: approved}
 				connMgr.SendResponse(resp)
 				if approved {
 					ui.NotifySuccess("Connection accepted", fmt.Sprintf("Connected to %s", req.FromName))
+					connMgr.LegacyConnect(req.FromIP)
 				} else {
 					ui.NotifyInfo(fmt.Sprintf("Connection request from %s declined", req.FromName))
 				}
+				fyne.Do(updatePage)
 			})
 		})
 	}
 
-	// обработчик ответа на запрос
 	connMgr.OnResult = func(resp network.ConnectionResponse) {
-		if resp.Accept {
-			connMgr.Connect(resp.FromIP)
-			ui.NotifySuccess("Connected", fmt.Sprintf("You are connected with %s", resp.FromIP))
-		} else {
-			ui.NotifyInfo(fmt.Sprintf("Device %s declined the connection request", resp.FromIP))
-		}
-		fyne.Do(updatePage)
+		fyne.Do(func() {
+			updatePage()
+			if resp.Accept {
+				connMgr.LegacyConnect(resp.FromIP)
+				ui.NotifySuccess("Connected", fmt.Sprintf("Connected with %s", resp.FromIP))
+			} else {
+				ui.NotifyInfo(fmt.Sprintf("%s declined connection", resp.FromIP))
+			}
+			updatePage()
+		})
 	}
 
 	prevBtn := widget.NewButtonWithIcon("", theme.NavigateBackIcon(), func() {
@@ -133,12 +125,9 @@ func Run() {
 	})
 	nextBtn := widget.NewButtonWithIcon("", theme.NavigateNextIcon(), func() {
 		ds.DevicesMu.RLock()
-		maxPage := len(ds.Devices)/pageSize - 1
-		if len(ds.Devices)%pageSize != 0 {
-			maxPage++
-		}
+		maxPage := (len(ds.Devices) + pageSize - 1) / pageSize
 		ds.DevicesMu.RUnlock()
-		if page < maxPage {
+		if page < maxPage-1 {
 			page++
 			fyne.Do(updatePage)
 		}
@@ -168,11 +157,7 @@ func Run() {
 	deviceListContainer.Resize(fyne.NewSize(300, 450))
 
 	content := container.NewVBox(
-		container.NewCenter(widget.NewLabelWithStyle(
-			"Share My Clipboard",
-			fyne.TextAlignCenter,
-			fyne.TextStyle{Bold: true},
-		)),
+		container.NewCenter(widget.NewLabelWithStyle("Share My Clipboard", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})),
 		widget.NewSeparator(),
 		container.NewCenter(deviceListContainer),
 	)
@@ -182,19 +167,20 @@ func Run() {
 		for {
 			select {
 			case <-scanTrigger:
-				if changed := ds.Scan(hostName); changed {
+				if ds.Scan(hostName) {
 					fyne.Do(func() {
 						fyne.CurrentApp().SendNotification(&fyne.Notification{
-							Title:   "Network scan",
+							Title:   "Network Scan",
 							Content: "Device list updated!",
 						})
 						updatePage()
 					})
 				}
 			case <-time.After(4 * time.Second):
-				if changed := ds.Scan(hostName); changed {
+				if ds.Scan(hostName) {
 					fyne.Do(updatePage)
 				}
+				connMgr.CheckDisconnects(&ds, func() { fyne.Do(updatePage) })
 			}
 		}
 	}()

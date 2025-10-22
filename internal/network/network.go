@@ -1,31 +1,38 @@
 package network
 
 import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/schollz/peerdiscovery"
 )
 
-// Device — структура устройства
+const connectionPort = 54322
+
+// ---------- DEVICE MODEL ----------
 type Device struct {
 	Name        string
 	IP          string
+	MAC         string
 	IsConnected bool
 }
 
-// DeviceStore управляет списком устройств
 type DeviceStore struct {
 	Devices   []Device
 	DevicesMu sync.RWMutex
 }
 
-// Scan обновляет список устройств, добавляет новые и удаляет те, которые пропали
+// ---------- DISCOVERY ----------
 func (s *DeviceStore) Scan(hostname string) bool {
 	discoveries, _ := peerdiscovery.Discover(peerdiscovery.Settings{
 		Limit:     -1,
 		Payload:   []byte(hostname),
-		Port:      "8877",
-		TimeLimit: 2,
+		Port:      "54322",
+		TimeLimit: 3 * time.Second,
 	})
 
 	s.DevicesMu.Lock()
@@ -37,26 +44,27 @@ func (s *DeviceStore) Scan(hostname string) bool {
 	for _, d := range discoveries {
 		ip := d.Address
 		name := string(d.Payload)
+		if isIgnoredIP(ip) {
+			continue
+		}
+		mac := getMAC(ip)
 		seen[ip] = true
-
 		found := false
+
 		for i := range s.Devices {
-			if s.Devices[i].IP == ip {
+			if s.Devices[i].MAC == mac {
+				s.Devices[i].IP = ip
+				s.Devices[i].Name = name
 				found = true
-				if s.Devices[i].Name != name {
-					s.Devices[i].Name = name
-					changed = true
-				}
 				break
 			}
 		}
 		if !found {
-			s.Devices = append(s.Devices, Device{Name: name, IP: ip})
+			s.Devices = append(s.Devices, Device{Name: name, IP: ip, MAC: mac})
 			changed = true
 		}
 	}
 
-	// удаляем устаревшие устройства
 	filtered := s.Devices[:0]
 	for _, dev := range s.Devices {
 		if seen[dev.IP] {
@@ -66,76 +74,233 @@ func (s *DeviceStore) Scan(hostname string) bool {
 		}
 	}
 	s.Devices = filtered
-
 	return changed
 }
 
-// GetPage возвращает текущую страницу списка
-func (s *DeviceStore) GetPage(page, pageSize int) []Device {
+func (s *DeviceStore) GetPage(page, size int) []Device {
 	s.DevicesMu.RLock()
 	defer s.DevicesMu.RUnlock()
-
-	start := page * pageSize
-	end := start + pageSize
+	start := page * size
+	end := start + size
 	if end > len(s.Devices) {
 		end = len(s.Devices)
 	}
 	return s.Devices[start:end]
 }
 
-// ConnectionManager управляет активными соединениями и обменом запросами
+func isIgnoredIP(ip string) bool {
+	return ip == "127.0.0.1" ||
+		strings.HasPrefix(ip, "192.168.56.") ||
+		strings.HasPrefix(ip, "10.") ||
+		strings.HasPrefix(ip, "169.254.")
+}
+
+// ---------- CONNECTION MANAGER ----------
 type ConnectionManager struct {
-	active    map[string]bool
-	mu        sync.RWMutex
-	OnRequest func(req ConnectionRequest)
-	OnResult  func(resp ConnectionResponse)
+	connections map[string]net.Conn
+	OnRequest   func(req ConnectionRequest)
+	OnResult    func(resp ConnectionResponse)
+	mu          sync.RWMutex
+	localIP     string
+}
+
+type ConnectionRequest struct {
+	Type     string
+	FromName string
+	FromIP   string
+	FromMAC  string
+	ToIP     string
+	ToMAC    string
+}
+
+type ConnectionResponse struct {
+	Type    string
+	FromIP  string
+	FromMAC string
+	ToIP    string
+	Accept  bool
 }
 
 func NewConnectionManager() *ConnectionManager {
-	return &ConnectionManager{
-		active: make(map[string]bool),
+	c := &ConnectionManager{connections: map[string]net.Conn{}}
+	c.localIP = getLocalIP()
+	go c.listenTCP()
+	return c
+}
+
+// ---------- TCP LISTENER ----------
+func (c *ConnectionManager) listenTCP() {
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", c.localIP, connectionPort))
+	if err != nil {
+		fmt.Println("listenTCP error:", err)
+		return
+	}
+	fmt.Println("TCP listener started on", listener.Addr())
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			continue
+		}
+		go c.handleConn(conn)
 	}
 }
 
-// Connect / Disconnect / IsConnected
-func (c *ConnectionManager) Connect(ip string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.active[ip] = true
+func (c *ConnectionManager) handleConn(conn net.Conn) {
+	defer conn.Close()
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return
+	}
+
+	var base map[string]interface{}
+	if json.Unmarshal(buf[:n], &base) != nil {
+		return
+	}
+
+	switch base["Type"] {
+	case "request":
+		var r ConnectionRequest
+		json.Unmarshal(buf[:n], &r)
+		if c.OnRequest != nil {
+			c.OnRequest(r)
+		}
+	case "response":
+		var r ConnectionResponse
+		json.Unmarshal(buf[:n], &r)
+		if c.OnResult != nil {
+			c.OnResult(r)
+		}
+	}
 }
+
+// ---------- CONNECTION SENDERS ----------
+func (c *ConnectionManager) SendRequest(req ConnectionRequest) {
+	req.Type = "request"
+	b, _ := json.Marshal(req)
+	conn, err := dialTCP(req.ToIP)
+	if err != nil {
+		fmt.Println("SendRequest error:", err)
+		return
+	}
+	defer conn.Close()
+	conn.Write(b)
+}
+
+func (c *ConnectionManager) SendResponse(resp ConnectionResponse) {
+	resp.Type = "response"
+	b, _ := json.Marshal(resp)
+	conn, err := dialTCP(resp.ToIP)
+	if err != nil {
+		fmt.Println("SendResponse error:", err)
+		return
+	}
+	defer conn.Close()
+	conn.Write(b)
+}
+
+// Принудительная привязка Dial к активному физическому IP
+func dialTCP(toIP string) (net.Conn, error) {
+	localIP := getLocalIP()
+	laddr, _ := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:0", localIP))
+	raddr, _ := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", toIP, connectionPort))
+	dialer := net.Dialer{LocalAddr: laddr, Timeout: 3 * time.Second}
+	return dialer.Dial("tcp", raddr.String())
+}
+
+// ---------- STATE CONTROL ----------
+func (c *ConnectionManager) Connect(ip string, conn net.Conn) {
+	c.mu.Lock()
+	c.connections[ip] = conn
+	c.mu.Unlock()
+}
+
 func (c *ConnectionManager) Disconnect(ip string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.active, ip)
+
+	conn, ok := c.connections[ip]
+	if ok && conn != nil {
+		_ = conn.Close()
+	}
+	delete(c.connections, ip)
+	fmt.Println("Disconnected from", ip)
 }
+
 func (c *ConnectionManager) IsConnected(ip string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.active[ip]
+	_, ok := c.connections[ip]
+	return ok
 }
 
-// ConnectionRequest — запрос на подключение
-type ConnectionRequest struct {
-	FromName string
-	FromIP   string
-	ToIP     string
-}
-
-// ConnectionResponse — ответ на запрос
-type ConnectionResponse struct {
-	FromIP string
-	ToIP   string
-	Accept bool
-}
-
-// HandleRequest и HandleResponse пока работают локально (эмуляция сети)
-func (c *ConnectionManager) SendRequest(req ConnectionRequest) {
-	if c.OnRequest != nil {
-		go c.OnRequest(req)
+// ---------- IP DETECTION ----------
+func getLocalIP() string {
+	interfaces, _ := net.Interfaces()
+	for _, iface := range interfaces {
+		name := strings.ToLower(iface.Name)
+		if (iface.Flags&net.FlagUp) == 0 || (iface.Flags&net.FlagLoopback) != 0 {
+			continue
+		}
+		if strings.Contains(name, "vbox") || strings.Contains(name, "virtual") || strings.Contains(name, "vm") {
+			continue
+		}
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+				ip := ipnet.IP.String()
+				if isIgnoredIP(ip) {
+					continue
+				}
+				return ip
+			}
+		}
 	}
+	// Подстраховка: получить IP активного маршрута
+	conn, err := net.Dial("udp", "192.168.0.1:80")
+	if err == nil {
+		defer conn.Close()
+		return conn.LocalAddr().(*net.UDPAddr).IP.String()
+	}
+	return "127.0.0.1"
 }
-func (c *ConnectionManager) SendResponse(resp ConnectionResponse) {
-	if c.OnResult != nil {
-		go c.OnResult(resp)
+
+func getMAC(ip string) string {
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		if iface.HardwareAddr != nil && len(iface.HardwareAddr) > 0 {
+			return iface.HardwareAddr.String()
+		}
+	}
+	return ""
+}
+
+// ---------- LEGACY COMPATIBILITY ----------
+func (c *ConnectionManager) LegacyConnect(ip string) {
+	c.mu.Lock()
+	if _, exists := c.connections[ip]; !exists {
+		c.connections[ip] = nil
+	}
+	c.mu.Unlock()
+}
+
+func (c *ConnectionManager) CheckDisconnects(ds *DeviceStore, update func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for ip := range c.connections {
+		found := false
+		ds.DevicesMu.RLock()
+		for _, d := range ds.Devices {
+			if d.IP == ip {
+				found = true
+				break
+			}
+		}
+		ds.DevicesMu.RUnlock()
+		if !found {
+			delete(c.connections, ip)
+			update()
+		}
 	}
 }
