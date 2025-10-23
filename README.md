@@ -185,7 +185,8 @@ go build -o share-my-clipboard-debug.exe
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details
+Contributions, bug reports, and feature requests are welcome!  
+Please open issues or pull requests on the GitHub repository
 
 ---
 
