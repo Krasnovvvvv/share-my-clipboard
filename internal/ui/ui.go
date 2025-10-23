@@ -11,7 +11,6 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-// MakeDeviceCard — карточка устройства
 func MakeDeviceCard(name, ip string, isConnected bool, onConnect func(ip string), onDisconnect func(ip string)) fyne.CanvasObject {
 	icon := widget.NewIcon(theme.ComputerIcon())
 	title := widget.NewLabelWithStyle(name, fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
@@ -41,7 +40,6 @@ func MakeDeviceCard(name, ip string, isConnected bool, onConnect func(ip string)
 	return container.NewVBox(card, border)
 }
 
-// ConfirmConnection выводит окно согласия
 func ConfirmConnection(w fyne.Window, requester string, cb func(bool)) {
 	dialog.ShowConfirm(
 		"Incoming connection",
@@ -51,7 +49,6 @@ func ConfirmConnection(w fyne.Window, requester string, cb func(bool)) {
 	)
 }
 
-// Нативные уведомления
 func NotifySuccess(title, msg string) {
 	fyne.CurrentApp().SendNotification(&fyne.Notification{Title: title, Content: msg})
 }
@@ -62,7 +59,6 @@ func NotifyError(msg string) {
 	fyne.CurrentApp().SendNotification(&fyne.Notification{Title: "Error", Content: msg})
 }
 
-// Отступ
 func NewMargin(h float32) fyne.CanvasObject {
 	r := canvas.NewRectangle(nil)
 	r.SetMinSize(fyne.NewSize(0, h))

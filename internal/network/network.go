@@ -365,7 +365,6 @@ func (c *ConnectionManager) establishConnection(ip, name string, conn net.Conn, 
 }
 
 // ---------- CONNECTION LOOPS ----------
-// FIXED: Use json.Decoder to properly handle streaming JSON
 func (c *ConnectionManager) readLoop(state *ConnectionState) {
 	defer c.handleConnectionClose(state)
 
@@ -612,7 +611,7 @@ func (c *ConnectionManager) BroadcastFileClipboard(fileName string, fileData []b
 	}
 	c.mu.RUnlock()
 
-	// FIXED: Use WaitGroup to ensure all sends complete
+	//Use WaitGroup to ensure all sends complete
 	var wg sync.WaitGroup
 	for _, state := range connections {
 		wg.Add(1)
