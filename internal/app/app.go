@@ -1,6 +1,8 @@
 package app
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/Krasnovvvvv/share-my-clipboard/internal/clipboard"
+	"github.com/Krasnovvvvv/share-my-clipboard/internal/ipc"
 	"github.com/Krasnovvvvv/share-my-clipboard/internal/network"
 	"github.com/Krasnovvvvv/share-my-clipboard/internal/ui"
 )
@@ -31,7 +34,7 @@ type FileTransferState struct {
 }
 
 func Run() {
-	a := app.NewWithID("com.krasnov.clipboard")
+	a := app.NewWithID("share-my-clipboard")
 	a.Settings().SetTheme(theme.DarkTheme())
 	w := a.NewWindow("Share My Clipboard")
 	w.Resize(fyne.NewSize(440, 530))
@@ -54,6 +57,56 @@ func Run() {
 	downloadDir := filepath.Join(homeDir, "Downloads", "ShareMyClipboard")
 	os.MkdirAll(downloadDir, 0755)
 	clipboardMgr := clipboard.NewManager(downloadDir)
+
+	// Start IPC server for context menu integration
+	ipcServer, err := ipc.NewIPCServer()
+	if err != nil {
+		fmt.Printf("Warning: Failed to start IPC server: %v\n", err)
+	} else {
+		// Register handler for file sending from context menu
+		ipcServer.RegisterHandler("send_files", func(data []byte) error {
+			var req ipc.SendFilesRequest
+			if err := json.Unmarshal(data, &req); err != nil {
+				return fmt.Errorf("failed to unmarshal request: %w", err)
+			}
+
+			if len(connMgr.GetConnectedIPs()) == 0 {
+				fyne.Do(func() {
+					ui.NotifyError("There are no connected devices to send the file!")
+				})
+				return errors.New("no connected devices")
+			}
+
+			fmt.Printf("[IPC] Received request to send %d file(s)\n", len(req.FilePaths))
+
+			// Process each file
+			for _, filePath := range req.FilePaths {
+				// Read file
+				fileData, err := os.ReadFile(filePath)
+				if err != nil {
+					fmt.Printf("[IPC] Failed to read %s: %v\n", filePath, err)
+					continue
+				}
+
+				// Calculate checksum
+				checksum := clipboard.ComputeFileChecksum(fileData)
+				fileName := filepath.Base(filePath)
+
+				// Broadcast to all connected devices
+				connMgr.BroadcastFileClipboard(fileName, fileData, checksum)
+
+				fmt.Printf("[IPC] Sent %s (%d bytes) to connected devices\n",
+					fileName, len(fileData))
+
+				// Show notification
+				fyne.Do(func() {
+					ui.NotifyInfo(fmt.Sprintf("Sending %s to connected devices...", fileName))
+				})
+			}
+
+			return nil
+		})
+	}
 
 	// UI elements
 	cardsBox := container.NewVBox()
@@ -96,6 +149,10 @@ func Run() {
 					})
 				},
 				func(ip string) {
+					deviceName := ds.FindNameByIP(ip)
+					if deviceName == "" {
+						deviceName = ip
+					}
 					if err := connMgr.Disconnect(ip); err != nil {
 						fyne.Do(func() {
 							ui.NotifyError(fmt.Sprintf("Failed to disconnect: %v", err))
@@ -103,7 +160,7 @@ func Run() {
 						return
 					}
 					fyne.Do(func() {
-						ui.NotifyInfo(fmt.Sprintf("Disconnected from %s", ip))
+						ui.NotifyInfo(fmt.Sprintf("Disconnected from %s", deviceName))
 					})
 					triggerUpdate()
 				},
@@ -145,6 +202,10 @@ func Run() {
 
 	// Connection response handler
 	connMgr.OnResult = func(resp network.ConnectionResponse) {
+		deviceName := ds.FindNameByIP(resp.FromIP)
+		if deviceName == "" {
+			deviceName = resp.FromIP
+		}
 		fyne.Do(func() {
 			if resp.Accept {
 				if err := connMgr.Connect(resp.FromIP, ""); err != nil {
@@ -152,9 +213,9 @@ func Run() {
 					triggerUpdate()
 					return
 				}
-				ui.NotifySuccess("Connected", fmt.Sprintf("Connected with %s", resp.FromIP))
+				ui.NotifySuccess("Connected", fmt.Sprintf("Connected with %s", deviceName))
 			} else {
-				ui.NotifyInfo(fmt.Sprintf("%s declined connection", resp.FromIP))
+				ui.NotifyInfo(fmt.Sprintf("%s declined connection", deviceName))
 			}
 			triggerUpdate()
 		})
@@ -168,11 +229,15 @@ func Run() {
 	})
 
 	connMgr.OnDisconnect = func(ip string, reason string) {
+		deviceName := ds.FindNameByIP(ip)
+		if deviceName == "" {
+			deviceName = ip
+		}
 		fyne.Do(func() {
 			if reason == "Hub shutdown" {
 				ui.NotifyInfo("Hub disconnected - all connections closed")
 			} else {
-				ui.NotifyInfo(fmt.Sprintf("Disconnected from %s: %s", ip, reason))
+				ui.NotifyInfo(fmt.Sprintf("Disconnected from %s: %s", deviceName, reason))
 			}
 			triggerUpdate()
 		})
@@ -183,6 +248,10 @@ func Run() {
 		if clipboardMgr == nil {
 			return
 		}
+		deviceName := ds.FindNameByIP(data.FromIP)
+		if deviceName == "" {
+			deviceName = data.FromIP
+		}
 		clipContent := clipboard.ClipboardContent{
 			Type: clipboard.ContentTypeText,
 			Text: data.Content,
@@ -191,7 +260,7 @@ func Run() {
 			fmt.Printf("Failed to set clipboard: %v\n", err)
 		} else {
 			fyne.Do(func() {
-				ui.NotifyInfo(fmt.Sprintf("Clipboard updated from %s", data.FromIP))
+				ui.NotifyInfo(fmt.Sprintf("Clipboard updated from %s", deviceName))
 			})
 		}
 	}
@@ -202,6 +271,10 @@ func Run() {
 
 	// File chunk start handler
 	connMgr.OnFileChunkStart = func(start network.FileChunkStart) {
+		deviceName := ds.FindNameByIP(start.FromIP)
+		if deviceName == "" {
+			deviceName = start.FromIP
+		}
 		fmt.Printf("[APP] File transfer started: %s (%d bytes, %d chunks)\n",
 			start.FileName, start.TotalSize, start.TotalChunks)
 		transfersMu.Lock()
@@ -215,7 +288,7 @@ func Run() {
 		}
 		transfersMu.Unlock()
 		fyne.Do(func() {
-			ui.NotifyInfo(fmt.Sprintf("Receiving %s from %s...", start.FileName, start.FromIP))
+			ui.NotifyInfo(fmt.Sprintf("Receiving %s from %s...", start.FileName, deviceName))
 		})
 	}
 
@@ -408,6 +481,9 @@ func Run() {
 		}
 		if len(connMgr.GetConnectedIPs()) > 0 {
 			connMgr.ShutdownAsHub()
+		}
+		if ipcServer != nil {
+			ipcServer.Stop()
 		}
 	})
 

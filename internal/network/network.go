@@ -844,6 +844,17 @@ func getMACForIP(ip string) string {
 	return ""
 }
 
+func (s *DeviceStore) FindNameByIP(ip string) string {
+	s.DevicesMu.RLock()
+	defer s.DevicesMu.RUnlock()
+	for _, d := range s.Devices {
+		if d.IP == ip {
+			return d.Name
+		}
+	}
+	return ""
+}
+
 func (c *ConnectionManager) CheckDisconnects(ds *DeviceStore, update func()) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
