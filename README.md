@@ -8,7 +8,7 @@
 [![Docs](https://img.shields.io/badge/docs-available-blue?style=flat-square)](./docs)
 
 [![Windows](https://img.shields.io/badge/platform-Windows-0078D6?style=flat-square&logo=windows)](https://www.microsoft.com/windows)
-[![Windows Build](https://github.com/Krasnovvvvv/share-my-clipboard/actions/workflows/go-build.yml/badge.svg?branch=main)](https://github.com/Krasnovvvvv/share-my-clipboard/actions/workflows/go-build.yml)
+[![Windows Build](https://img.shields.io/github/actions/workflow/status/Krasnovvvvv/share-my-clipboard/go-build.yml?branch=main&style=flat-square&logo=githubactions&label=windows-build)](https://github.com/Krasnovvvvv/share-my-clipboard/actions/workflows/go-build.yml)
 
 
 Share My Clipboard is a powerful, user-friendly desktop application that enables instant clipboard synchronization and file transfers between Windows computers on the same network — no cloud, no internet required! 🌐
