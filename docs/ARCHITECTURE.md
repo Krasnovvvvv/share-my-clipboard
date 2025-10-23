@@ -286,7 +286,3 @@ File transfers use dedicated goroutines to avoid blocking main thread.
 - [Go Concurrency Patterns](https://go.dev/blog/pipelines)
 - [TCP/IP Network Programming](https://beej.us/guide/bgnet/)
 - [Clipboard API Design](https://developer.mozilla.org/en-US/docs/Web/API/Clipboard_API)
-
----
-
-**For questions or contributions, see [CONTRIBUTING.md](../CONTRIBUTING.md)**
