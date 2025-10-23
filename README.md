@@ -201,13 +201,6 @@ If you like this project, please give it a ⭐ on GitHub!
 
 ---
 
-## 📬 Contact
-
-- **GitHub Issues**: [Report bugs or request features](https://github.com/Krasnovvvvv/share-my-clipboard/issues)
-- **Discussions**: [Join the community](https://github.com/Krasnovvvvv/share-my-clipboard/discussions)
-
----
-
 ## 🙏 Acknowledgments
 
 Built with amazing open-source projects:
