@@ -40,14 +40,19 @@ jobs:
       continue-on-error: true
 
     # -------- SIGNING SECTION -------- #
-    - name: Download signtool
+    - name: Locate SignTool
       shell: pwsh
+      id: signtool
       run: |
-        Write-Host "Checking if SignTool is available..."
-        if (-Not (Get-Command signtool.exe -ErrorAction SilentlyContinue)) {
-          Write-Host "Installing Windows SDK..."
-          choco install windows-sdk-10-versioned -y
+        $signtool = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\" -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -eq "signtool.exe" } |
+        Select-Object -First 1 -ExpandProperty FullName
+        if (!$signtool) {
+        Write-Error "❌ SignTool not found in system paths!"
+        exit 1
         }
+        Write-Host "✅ Found SignTool at: $signtool"
+        echo "signtool_path=$signtool" | Out-File -Append -FilePath $env:GITHUB_ENV
 
     - name: Sign Windows Binaries
       shell: pwsh
