@@ -178,8 +178,6 @@ go build -o share-my-clipboard-debug.exe
 
 - [**Architecture Guide**](docs/ARCHITECTURE.md) — Deep dive into technical design
 - [**Технические детали (RU)**](docs/TECHNICAL_RU.md) — Подробное объяснение технологий
-- [**API Documentation**](docs/API.md) — Internal API reference
-- [**Contributing Guide**](CONTRIBUTING.md) — How to contribute
 
 ---
 
