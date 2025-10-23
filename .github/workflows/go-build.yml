@@ -1,4 +1,4 @@
-name: Build
+name: Build and Sign
 
 on:
   push:
@@ -20,52 +20,52 @@ jobs:
       with:
         go-version: '1.22'
 
-    - name: Cache Go modules
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~\AppData\Local\go-build
-          ~\go\pkg\mod
-        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-        restore-keys: |
-          ${{ runner.os }}-go-
-
-    - name: Download dependencies
+    - name: Download Go dependencies
       run: go mod download
 
-    - name: Build GUI application
+    - name: Build GUI App (no console)
       run: go build -ldflags="-H=windowsgui -s -w" -o share-my-clipboard.exe
 
-    - name: Build debug version (with console)
+    - name: Build Debug App (with console)
       run: go build -ldflags="-s -w" -o share-my-clipboard-debug.exe
 
-    - name: Run tests
+    - name: Run Tests
       run: go test -v ./...
 
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: windows-binaries
-        path: |
-          share-my-clipboard.exe
-          share-my-clipboard-debug.exe
-
-  lint:
-    name: Lint Code
-    runs-on: windows-latest
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.22'
-
-    - name: golangci-lint
+    - name: Code Lint
       uses: golangci/golangci-lint-action@v6
       with:
         version: v1.61
         args: --timeout=5m --out-format=colored-line-number
       continue-on-error: true
+
+    # -------- SIGNING SECTION -------- #
+    - name: Download signtool
+      shell: pwsh
+      run: |
+        Write-Host "Checking if SignTool is available..."
+        if (-Not (Get-Command signtool.exe -ErrorAction SilentlyContinue)) {
+          Write-Host "Installing Windows SDK..."
+          choco install windows-sdk-10-versioned -y
+        }
+
+    - name: Sign Windows Binaries
+      shell: pwsh
+      env:
+        SIGN_CERT: ${{ secrets.WIN_SIGN_CERT }}
+        SIGN_PASS: ${{ secrets.WIN_SIGN_PASS }}
+      run: |
+        Write-Host "Signing executables..."
+        New-Item -Path "$env:USERPROFILE\\cert.pfx" -ItemType File -Force | Out-Null
+        [System.Convert]::FromBase64String($env:SIGN_CERT) | Set-Content -Encoding Byte "$env:USERPROFILE\\cert.pfx"
+        signtool sign /f "$env:USERPROFILE\\cert.pfx" /p "$env:SIGN_PASS" /tr http://timestamp.digicert.com /td SHA256 /fd SHA256 share-my-clipboard.exe
+        signtool sign /f "$env:USERPROFILE\\cert.pfx" /p "$env:SIGN_PASS" /tr http://timestamp.digicert.com /td SHA256 /fd SHA256 share-my-clipboard-debug.exe
+        Write-Host "✅ Signing completed!"
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: signed-windows-builds
+        path: |
+          share-my-clipboard.exe
+          share-my-clipboard-debug.exe
