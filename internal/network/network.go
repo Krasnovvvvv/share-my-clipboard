@@ -11,7 +11,24 @@ import (
 	"github.com/schollz/peerdiscovery"
 )
 
-const connectionPort = 54322
+const (
+	connectionPort    = 54322
+	heartbeatInterval = 5 * time.Second
+	connectionTimeout = 15 * time.Second
+)
+
+// ---------- MESSAGE TYPES ----------
+type MessageType string
+
+const (
+	MsgTypeRequest      MessageType = "request"
+	MsgTypeResponse     MessageType = "response"
+	MsgTypeHeartbeat    MessageType = "heartbeat"
+	MsgTypeHeartbeatAck MessageType = "heartbeat_ack"
+	MsgTypeClipboard    MessageType = "clipboard"
+	MsgTypeDisconnect   MessageType = "disconnect"
+	MsgTypeShutdown     MessageType = "shutdown"
+)
 
 // ---------- DEVICE MODEL ----------
 type Device struct {
@@ -26,12 +43,87 @@ type DeviceStore struct {
 	DevicesMu sync.RWMutex
 }
 
+// ---------- MESSAGE STRUCTURES ----------
+type Message struct {
+	Type MessageType     `json:"type"`
+	Data json.RawMessage `json:"data,omitempty"`
+}
+
+type ConnectionRequest struct {
+	FromName string `json:"from_name"`
+	FromIP   string `json:"from_ip"`
+	FromMAC  string `json:"from_mac"`
+	ToIP     string `json:"to_ip"`
+}
+
+type ConnectionResponse struct {
+	FromIP  string `json:"from_ip"`
+	FromMAC string `json:"from_mac"`
+	ToIP    string `json:"to_ip"`
+	Accept  bool   `json:"accept"`
+}
+
+type HeartbeatMessage struct {
+	FromIP    string    `json:"from_ip"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+type ClipboardData struct {
+	FromIP    string `json:"from_ip"`
+	Content   string `json:"content"`
+	Timestamp int64  `json:"timestamp"`
+}
+
+type DisconnectMessage struct {
+	FromIP string `json:"from_ip"`
+	Reason string `json:"reason"`
+}
+
+// ---------- CONNECTION STATE ----------
+type ConnectionState struct {
+	conn          net.Conn
+	ip            string
+	name          string
+	isHub         bool // true if we initiated the connection
+	lastHeartbeat time.Time
+	readChan      chan Message
+	writeChan     chan Message
+	closeChan     chan struct{}
+	mu            sync.RWMutex
+}
+
+// ---------- CONNECTION MANAGER ----------
+type ConnectionManager struct {
+	connections map[string]*ConnectionState
+	listener    net.Listener
+	LocalIP     string
+	hostname    string
+	mu          sync.RWMutex
+
+	// Callbacks
+	OnRequest         func(req ConnectionRequest)
+	OnResult          func(resp ConnectionResponse)
+	OnDisconnect      func(ip string, reason string)
+	OnClipboard       func(data ClipboardData)
+	onConnEstablished func(ip string)
+}
+
+func NewConnectionManager(hostname string) *ConnectionManager {
+	c := &ConnectionManager{
+		connections: make(map[string]*ConnectionState),
+		hostname:    hostname,
+	}
+	c.LocalIP = getPreferredLocalIP()
+	go c.listenTCP()
+	return c
+}
+
 // ---------- DISCOVERY ----------
 func (s *DeviceStore) Scan(hostname string) bool {
 	discoveries, _ := peerdiscovery.Discover(peerdiscovery.Settings{
 		Limit:     -1,
 		Payload:   []byte(hostname),
-		Port:      "54322",
+		Port:      fmt.Sprintf("%d", connectionPort),
 		TimeLimit: 3 * time.Second,
 	})
 
@@ -44,27 +136,37 @@ func (s *DeviceStore) Scan(hostname string) bool {
 	for _, d := range discoveries {
 		ip := d.Address
 		name := string(d.Payload)
+
 		if isIgnoredIP(ip) {
 			continue
 		}
-		mac := getMAC(ip)
-		seen[ip] = true
-		found := false
 
+		mac := getMACForIP(ip)
+		seen[ip] = true
+
+		// ИСПРАВЛЕНО: Используем IP как первичный ключ
+		found := false
 		for i := range s.Devices {
-			if s.Devices[i].MAC == mac {
-				s.Devices[i].IP = ip
-				s.Devices[i].Name = name
+			if s.Devices[i].IP == ip {
+				// Устройство уже есть, обновляем только если изменилось
+				if s.Devices[i].Name != name || s.Devices[i].MAC != mac {
+					s.Devices[i].Name = name
+					s.Devices[i].MAC = mac
+					changed = true
+				}
 				found = true
 				break
 			}
 		}
+
 		if !found {
+			// Новое устройство
 			s.Devices = append(s.Devices, Device{Name: name, IP: ip, MAC: mac})
 			changed = true
 		}
 	}
 
+	// Remove devices that are no longer visible
 	filtered := s.Devices[:0]
 	for _, dev := range s.Devices {
 		if seen[dev.IP] {
@@ -74,220 +176,554 @@ func (s *DeviceStore) Scan(hostname string) bool {
 		}
 	}
 	s.Devices = filtered
+
 	return changed
 }
 
 func (s *DeviceStore) GetPage(page, size int) []Device {
 	s.DevicesMu.RLock()
 	defer s.DevicesMu.RUnlock()
+
 	start := page * size
 	end := start + size
 	if end > len(s.Devices) {
 		end = len(s.Devices)
 	}
+	if start >= len(s.Devices) {
+		return []Device{}
+	}
+
 	return s.Devices[start:end]
+}
+
+// ---------- TCP LISTENER ----------
+func (c *ConnectionManager) listenTCP() {
+	var err error
+	c.listener, err = net.Listen("tcp", fmt.Sprintf(":%d", connectionPort))
+	if err != nil {
+		fmt.Printf("listenTCP error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("TCP listener started on %s\n", c.listener.Addr())
+
+	for {
+		conn, err := c.listener.Accept()
+		if err != nil {
+			continue
+		}
+
+		// Enable TCP keepalive
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		}
+
+		go c.handleIncomingConnection(conn)
+	}
+}
+
+func (c *ConnectionManager) handleIncomingConnection(conn net.Conn) {
+	// Read first message to determine what type of connection this is
+	buf := make([]byte, 4096)
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	n, err := conn.Read(buf)
+	if err != nil {
+		conn.Close()
+		return
+	}
+	conn.SetReadDeadline(time.Time{}) // Clear deadline
+
+	var msg Message
+	if err := json.Unmarshal(buf[:n], &msg); err != nil {
+		conn.Close()
+		return
+	}
+
+	switch msg.Type {
+	case MsgTypeRequest:
+		var req ConnectionRequest
+		json.Unmarshal(msg.Data, &req)
+		if c.OnRequest != nil {
+			c.OnRequest(req)
+		}
+		conn.Close() // Close this connection
+
+	case MsgTypeResponse:
+		var resp ConnectionResponse
+		json.Unmarshal(msg.Data, &resp)
+		if c.OnResult != nil {
+			c.OnResult(resp)
+		}
+		conn.Close() // Close this connection
+
+	default:
+		// ИСПРАВЛЕНО: Это персистентное соединение от инициатора
+		remoteIP := strings.Split(conn.RemoteAddr().String(), ":")[0]
+		fmt.Printf("[DEBUG] Accepting persistent connection from %s\n", remoteIP)
+		c.establishConnection(remoteIP, "", conn, false)
+	}
+}
+
+// ---------- CONNECTION ESTABLISHMENT ----------
+func (c *ConnectionManager) SendRequest(req ConnectionRequest) error {
+	msg := Message{
+		Type: MsgTypeRequest,
+	}
+	msg.Data, _ = json.Marshal(req)
+
+	return c.sendOneTimeMessage(req.ToIP, msg)
+}
+
+func (c *ConnectionManager) SendResponse(resp ConnectionResponse) error {
+	msg := Message{
+		Type: MsgTypeResponse,
+	}
+	msg.Data, _ = json.Marshal(resp)
+
+	return c.sendOneTimeMessage(resp.ToIP, msg)
+}
+
+func (c *ConnectionManager) sendOneTimeMessage(ip string, msg Message) error {
+	conn, err := c.dialTCP(ip)
+	if err != nil {
+		return fmt.Errorf("sendOneTimeMessage dial error: %w", err)
+	}
+	defer conn.Close()
+
+	data, _ := json.Marshal(msg)
+	_, err = conn.Write(data)
+	return err
+}
+
+// ИСПРАВЛЕНО: Только инициатор вызывает Connect
+func (c *ConnectionManager) Connect(ip, name string) error {
+	// Небольшая задержка чтобы избежать race condition
+	time.Sleep(100 * time.Millisecond)
+
+	// Initiate persistent connection
+	conn, err := c.dialTCP(ip)
+	if err != nil {
+		return fmt.Errorf("connect dial error: %w", err)
+	}
+
+	// Enable TCP keepalive
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	fmt.Printf("[DEBUG] Initiating persistent connection to %s\n", ip)
+	return c.establishConnection(ip, name, conn, true)
+}
+
+func (c *ConnectionManager) establishConnection(ip, name string, conn net.Conn, isHub bool) error {
+	c.mu.Lock()
+
+	// Check if already connected
+	if _, exists := c.connections[ip]; exists {
+		c.mu.Unlock()
+		conn.Close()
+		fmt.Printf("[DEBUG] Already connected to %s, closing duplicate\n", ip)
+		return fmt.Errorf("already connected to %s", ip)
+	}
+
+	state := &ConnectionState{
+		conn:          conn,
+		ip:            ip,
+		name:          name,
+		isHub:         isHub,
+		lastHeartbeat: time.Now(),
+		readChan:      make(chan Message, 10),
+		writeChan:     make(chan Message, 10),
+		closeChan:     make(chan struct{}),
+	}
+
+	c.connections[ip] = state
+	c.mu.Unlock()
+
+	fmt.Printf("[DEBUG] Connection established with %s (isHub=%v)\n", ip, isHub)
+
+	// Start goroutines for this connection
+	go c.readLoop(state)
+	go c.writeLoop(state)
+	go c.heartbeatLoop(state)
+
+	if c.onConnEstablished != nil {
+		c.onConnEstablished(ip)
+	}
+
+	return nil
+}
+
+// ---------- CONNECTION LOOPS ----------
+func (c *ConnectionManager) readLoop(state *ConnectionState) {
+	defer c.handleConnectionClose(state)
+
+	buf := make([]byte, 65536)
+	for {
+		select {
+		case <-state.closeChan:
+			return
+		default:
+		}
+
+		state.conn.SetReadDeadline(time.Now().Add(connectionTimeout))
+		n, err := state.conn.Read(buf)
+		if err != nil {
+			fmt.Printf("[DEBUG] Read error from %s: %v\n", state.ip, err)
+			return
+		}
+
+		var msg Message
+		if err := json.Unmarshal(buf[:n], &msg); err != nil {
+			continue
+		}
+
+		c.handleMessage(state, msg)
+	}
+}
+
+func (c *ConnectionManager) writeLoop(state *ConnectionState) {
+	for {
+		select {
+		case <-state.closeChan:
+			return
+		case msg := <-state.writeChan:
+			data, err := json.Marshal(msg)
+			if err != nil {
+				continue
+			}
+
+			state.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if _, err := state.conn.Write(data); err != nil {
+				fmt.Printf("[DEBUG] Write error to %s: %v\n", state.ip, err)
+				return
+			}
+		}
+	}
+}
+
+func (c *ConnectionManager) heartbeatLoop(state *ConnectionState) {
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-state.closeChan:
+			return
+		case <-ticker.C:
+			// Send heartbeat
+			hb := HeartbeatMessage{
+				FromIP:    c.LocalIP,
+				Timestamp: time.Now(),
+			}
+			msg := Message{Type: MsgTypeHeartbeat}
+			msg.Data, _ = json.Marshal(hb)
+
+			select {
+			case state.writeChan <- msg:
+			case <-time.After(1 * time.Second):
+				return
+			}
+
+			// Check if we received heartbeat recently
+			state.mu.RLock()
+			lastHB := state.lastHeartbeat
+			state.mu.RUnlock()
+
+			if time.Since(lastHB) > connectionTimeout {
+				fmt.Printf("[DEBUG] Connection to %s timed out\n", state.ip)
+				return
+			}
+		}
+	}
+}
+
+func (c *ConnectionManager) handleMessage(state *ConnectionState, msg Message) {
+	switch msg.Type {
+	case MsgTypeHeartbeat:
+		// Respond with heartbeat ack
+		ack := Message{Type: MsgTypeHeartbeatAck}
+		select {
+		case state.writeChan <- ack:
+		default:
+		}
+
+	case MsgTypeHeartbeatAck:
+		// Update last heartbeat time
+		state.mu.Lock()
+		state.lastHeartbeat = time.Now()
+		state.mu.Unlock()
+
+	case MsgTypeClipboard:
+		var clipData ClipboardData
+		if err := json.Unmarshal(msg.Data, &clipData); err == nil {
+			if c.OnClipboard != nil {
+				c.OnClipboard(clipData)
+			}
+		}
+
+	case MsgTypeDisconnect:
+		var discMsg DisconnectMessage
+		if err := json.Unmarshal(msg.Data, &discMsg); err == nil {
+			if c.OnDisconnect != nil {
+				c.OnDisconnect(discMsg.FromIP, discMsg.Reason)
+			}
+		}
+
+	case MsgTypeShutdown:
+		if c.OnDisconnect != nil {
+			c.OnDisconnect(state.ip, "Hub shutdown")
+		}
+	}
+}
+
+func (c *ConnectionManager) handleConnectionClose(state *ConnectionState) {
+	state.conn.Close()
+
+	c.mu.Lock()
+	delete(c.connections, state.ip)
+	c.mu.Unlock()
+
+	fmt.Printf("[DEBUG] Connection closed with %s\n", state.ip)
+
+	if c.OnDisconnect != nil {
+		c.OnDisconnect(state.ip, "Connection closed")
+	}
+}
+
+// ---------- DISCONNECTION ----------
+func (c *ConnectionManager) Disconnect(ip string) error {
+	c.mu.Lock()
+	state, exists := c.connections[ip]
+	c.mu.Unlock()
+
+	if !exists {
+		return fmt.Errorf("not connected to %s", ip)
+	}
+
+	// Send disconnect message
+	discMsg := DisconnectMessage{
+		FromIP: c.LocalIP,
+		Reason: "User disconnected",
+	}
+	msg := Message{Type: MsgTypeDisconnect}
+	msg.Data, _ = json.Marshal(discMsg)
+
+	select {
+	case state.writeChan <- msg:
+		time.Sleep(100 * time.Millisecond)
+	case <-time.After(1 * time.Second):
+	}
+
+	close(state.closeChan)
+	return nil
+}
+
+func (c *ConnectionManager) DisconnectAll() {
+	c.mu.RLock()
+	ips := make([]string, 0, len(c.connections))
+	for ip := range c.connections {
+		ips = append(ips, ip)
+	}
+	c.mu.RUnlock()
+
+	for _, ip := range ips {
+		c.Disconnect(ip)
+	}
+}
+
+func (c *ConnectionManager) ShutdownAsHub() {
+	msg := Message{Type: MsgTypeShutdown}
+
+	c.mu.RLock()
+	for _, state := range c.connections {
+		select {
+		case state.writeChan <- msg:
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	c.mu.RUnlock()
+
+	time.Sleep(200 * time.Millisecond)
+	c.DisconnectAll()
+}
+
+// ---------- CLIPBOARD BROADCAST ----------
+func (c *ConnectionManager) BroadcastClipboard(content string) {
+	clipData := ClipboardData{
+		FromIP:    c.LocalIP,
+		Content:   content,
+		Timestamp: time.Now().Unix(),
+	}
+
+	msg := Message{Type: MsgTypeClipboard}
+	msg.Data, _ = json.Marshal(clipData)
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	for _, state := range c.connections {
+		select {
+		case state.writeChan <- msg:
+		case <-time.After(500 * time.Millisecond):
+			fmt.Printf("Failed to send clipboard to %s\n", state.ip)
+		}
+	}
+}
+
+// ---------- STATE QUERIES ----------
+func (c *ConnectionManager) IsConnected(ip string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, exists := c.connections[ip]
+	return exists
+}
+
+func (c *ConnectionManager) GetConnectedIPs() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	ips := make([]string, 0, len(c.connections))
+	for ip := range c.connections {
+		ips = append(ips, ip)
+	}
+	return ips
+}
+
+func (c *ConnectionManager) SetOnConnEstablished(callback func(string)) {
+	c.onConnEstablished = callback
+}
+
+// ---------- NETWORK UTILITIES ----------
+func (c *ConnectionManager) dialTCP(toIP string) (net.Conn, error) {
+	localIP := c.LocalIP
+	laddr, _ := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:0", localIP))
+	raddr, _ := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", toIP, connectionPort))
+
+	dialer := net.Dialer{
+		LocalAddr: laddr,
+		Timeout:   5 * time.Second,
+	}
+
+	return dialer.Dial("tcp", raddr.String())
+}
+
+func getPreferredLocalIP() string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "127.0.0.1"
+	}
+
+	var ethernetIP, wifiIP, otherIP string
+
+	for _, iface := range interfaces {
+		if (iface.Flags&net.FlagUp) == 0 || (iface.Flags&net.FlagLoopback) != 0 {
+			continue
+		}
+
+		name := strings.ToLower(iface.Name)
+
+		if strings.Contains(name, "vbox") ||
+			strings.Contains(name, "virtual") ||
+			strings.Contains(name, "vm") ||
+			strings.Contains(name, "docker") ||
+			strings.Contains(name, "veth") {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok || ipnet.IP.To4() == nil {
+				continue
+			}
+
+			ip := ipnet.IP.String()
+			if isIgnoredIP(ip) {
+				continue
+			}
+
+			if strings.Contains(name, "eth") || strings.Contains(name, "en") {
+				if ethernetIP == "" {
+					ethernetIP = ip
+				}
+			} else if strings.Contains(name, "wlan") || strings.Contains(name, "wi") {
+				if wifiIP == "" {
+					wifiIP = ip
+				}
+			} else {
+				if otherIP == "" {
+					otherIP = ip
+				}
+			}
+		}
+	}
+
+	if ethernetIP != "" {
+		fmt.Printf("Selected Ethernet IP: %s\n", ethernetIP)
+		return ethernetIP
+	}
+	if wifiIP != "" {
+		fmt.Printf("Selected Wi-Fi IP: %s\n", wifiIP)
+		return wifiIP
+	}
+	if otherIP != "" {
+		fmt.Printf("Selected other IP: %s\n", otherIP)
+		return otherIP
+	}
+
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err == nil {
+		defer conn.Close()
+		localAddr := conn.LocalAddr().(*net.UDPAddr)
+		fmt.Printf("Selected fallback IP: %s\n", localAddr.IP.String())
+		return localAddr.IP.String()
+	}
+
+	return "127.0.0.1"
 }
 
 func isIgnoredIP(ip string) bool {
 	return ip == "127.0.0.1" ||
 		strings.HasPrefix(ip, "192.168.56.") ||
-		strings.HasPrefix(ip, "10.") ||
-		strings.HasPrefix(ip, "169.254.")
+		strings.HasPrefix(ip, "169.254.") ||
+		strings.HasPrefix(ip, "172.17.") ||
+		strings.HasPrefix(ip, "172.18.")
 }
 
-// ---------- CONNECTION MANAGER ----------
-type ConnectionManager struct {
-	connections map[string]net.Conn
-	OnRequest   func(req ConnectionRequest)
-	OnResult    func(resp ConnectionResponse)
-	mu          sync.RWMutex
-	localIP     string
-}
-
-type ConnectionRequest struct {
-	Type     string
-	FromName string
-	FromIP   string
-	FromMAC  string
-	ToIP     string
-	ToMAC    string
-}
-
-type ConnectionResponse struct {
-	Type    string
-	FromIP  string
-	FromMAC string
-	ToIP    string
-	Accept  bool
-}
-
-func NewConnectionManager() *ConnectionManager {
-	c := &ConnectionManager{connections: map[string]net.Conn{}}
-	c.localIP = getLocalIP()
-	go c.listenTCP()
-	return c
-}
-
-// ---------- TCP LISTENER ----------
-func (c *ConnectionManager) listenTCP() {
-	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", c.localIP, connectionPort))
+func getMACForIP(ip string) string {
+	interfaces, err := net.Interfaces()
 	if err != nil {
-		fmt.Println("listenTCP error:", err)
-		return
+		return ""
 	}
-	fmt.Println("TCP listener started on", listener.Addr())
 
-	for {
-		conn, err := listener.Accept()
+	for _, iface := range interfaces {
+		addrs, err := iface.Addrs()
 		if err != nil {
 			continue
 		}
-		go c.handleConn(conn)
-	}
-}
 
-func (c *ConnectionManager) handleConn(conn net.Conn) {
-	defer conn.Close()
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return
-	}
-
-	var base map[string]interface{}
-	if json.Unmarshal(buf[:n], &base) != nil {
-		return
-	}
-
-	switch base["Type"] {
-	case "request":
-		var r ConnectionRequest
-		json.Unmarshal(buf[:n], &r)
-		if c.OnRequest != nil {
-			c.OnRequest(r)
-		}
-	case "response":
-		var r ConnectionResponse
-		json.Unmarshal(buf[:n], &r)
-		if c.OnResult != nil {
-			c.OnResult(r)
-		}
-	}
-}
-
-// ---------- CONNECTION SENDERS ----------
-func (c *ConnectionManager) SendRequest(req ConnectionRequest) {
-	req.Type = "request"
-	b, _ := json.Marshal(req)
-	conn, err := dialTCP(req.ToIP)
-	if err != nil {
-		fmt.Println("SendRequest error:", err)
-		return
-	}
-	defer conn.Close()
-	conn.Write(b)
-}
-
-func (c *ConnectionManager) SendResponse(resp ConnectionResponse) {
-	resp.Type = "response"
-	b, _ := json.Marshal(resp)
-	conn, err := dialTCP(resp.ToIP)
-	if err != nil {
-		fmt.Println("SendResponse error:", err)
-		return
-	}
-	defer conn.Close()
-	conn.Write(b)
-}
-
-// Принудительная привязка Dial к активному физическому IP
-func dialTCP(toIP string) (net.Conn, error) {
-	localIP := getLocalIP()
-	laddr, _ := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:0", localIP))
-	raddr, _ := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", toIP, connectionPort))
-	dialer := net.Dialer{LocalAddr: laddr, Timeout: 3 * time.Second}
-	return dialer.Dial("tcp", raddr.String())
-}
-
-// ---------- STATE CONTROL ----------
-func (c *ConnectionManager) Connect(ip string, conn net.Conn) {
-	c.mu.Lock()
-	c.connections[ip] = conn
-	c.mu.Unlock()
-}
-
-func (c *ConnectionManager) Disconnect(ip string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	conn, ok := c.connections[ip]
-	if ok && conn != nil {
-		_ = conn.Close()
-	}
-	delete(c.connections, ip)
-	fmt.Println("Disconnected from", ip)
-}
-
-func (c *ConnectionManager) IsConnected(ip string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	_, ok := c.connections[ip]
-	return ok
-}
-
-// ---------- IP DETECTION ----------
-func getLocalIP() string {
-	interfaces, _ := net.Interfaces()
-	for _, iface := range interfaces {
-		name := strings.ToLower(iface.Name)
-		if (iface.Flags&net.FlagUp) == 0 || (iface.Flags&net.FlagLoopback) != 0 {
-			continue
-		}
-		if strings.Contains(name, "vbox") || strings.Contains(name, "virtual") || strings.Contains(name, "vm") {
-			continue
-		}
-		addrs, _ := iface.Addrs()
 		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
-				ip := ipnet.IP.String()
-				if isIgnoredIP(ip) {
-					continue
-				}
-				return ip
+			ipnet, ok := addr.(*net.IPNet)
+			if ok && ipnet.IP.String() == ip {
+				return iface.HardwareAddr.String()
 			}
 		}
 	}
-	// Подстраховка: получить IP активного маршрута
-	conn, err := net.Dial("udp", "192.168.0.1:80")
-	if err == nil {
-		defer conn.Close()
-		return conn.LocalAddr().(*net.UDPAddr).IP.String()
-	}
-	return "127.0.0.1"
-}
 
-func getMAC(ip string) string {
-	ifaces, _ := net.Interfaces()
-	for _, iface := range ifaces {
-		if iface.HardwareAddr != nil && len(iface.HardwareAddr) > 0 {
-			return iface.HardwareAddr.String()
-		}
-	}
 	return ""
-}
-
-// ---------- LEGACY COMPATIBILITY ----------
-func (c *ConnectionManager) LegacyConnect(ip string) {
-	c.mu.Lock()
-	if _, exists := c.connections[ip]; !exists {
-		c.connections[ip] = nil
-	}
-	c.mu.Unlock()
 }
 
 func (c *ConnectionManager) CheckDisconnects(ds *DeviceStore, update func()) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	for ip := range c.connections {
 		found := false
 		ds.DevicesMu.RLock()
@@ -298,9 +734,9 @@ func (c *ConnectionManager) CheckDisconnects(ds *DeviceStore, update func()) {
 			}
 		}
 		ds.DevicesMu.RUnlock()
+
 		if !found {
-			delete(c.connections, ip)
-			update()
+			// Device disappeared, will be handled by heartbeat timeout
 		}
 	}
 }
