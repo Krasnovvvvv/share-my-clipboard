@@ -15,6 +15,7 @@ const (
 	connectionPort    = 54322
 	heartbeatInterval = 5 * time.Second
 	connectionTimeout = 15 * time.Second
+	FileChunkSize     = 512 * 1024 // 512KB chunks
 )
 
 // ---------- MESSAGE TYPES ----------
@@ -28,6 +29,10 @@ const (
 	MsgTypeClipboard    MessageType = "clipboard"
 	MsgTypeDisconnect   MessageType = "disconnect"
 	MsgTypeShutdown     MessageType = "shutdown"
+
+	MsgTypeFileChunkStart    MessageType = "file_chunk_start"
+	MsgTypeFileChunkData     MessageType = "file_chunk_data"
+	MsgTypeFileChunkComplete MessageType = "file_chunk_complete"
 )
 
 // ---------- DEVICE MODEL ----------
@@ -79,12 +84,32 @@ type DisconnectMessage struct {
 	Reason string `json:"reason"`
 }
 
+type FileChunkStart struct {
+	FileID      string `json:"file_id"`
+	FileName    string `json:"file_name"`
+	TotalSize   int64  `json:"total_size"`
+	TotalChunks int    `json:"total_chunks"`
+	Checksum    string `json:"checksum"`
+	FromIP      string `json:"from_ip"`
+}
+
+type FileChunkData struct {
+	FileID     string `json:"file_id"`
+	ChunkIndex int    `json:"chunk_index"`
+	Data       []byte `json:"data"`
+}
+
+type FileChunkComplete struct {
+	FileID   string `json:"file_id"`
+	Checksum string `json:"checksum"`
+}
+
 // ---------- CONNECTION STATE ----------
 type ConnectionState struct {
 	conn          net.Conn
 	ip            string
 	name          string
-	isHub         bool // true if we initiated the connection
+	isHub         bool
 	lastHeartbeat time.Time
 	readChan      chan Message
 	writeChan     chan Message
@@ -100,12 +125,14 @@ type ConnectionManager struct {
 	hostname    string
 	mu          sync.RWMutex
 
-	// Callbacks
-	OnRequest         func(req ConnectionRequest)
-	OnResult          func(resp ConnectionResponse)
-	OnDisconnect      func(ip string, reason string)
-	OnClipboard       func(data ClipboardData)
-	onConnEstablished func(ip string)
+	OnRequest           func(req ConnectionRequest)
+	OnResult            func(resp ConnectionResponse)
+	OnDisconnect        func(ip string, reason string)
+	OnClipboard         func(data ClipboardData)
+	OnFileChunkStart    func(start FileChunkStart)
+	OnFileChunkData     func(chunk FileChunkData)
+	OnFileChunkComplete func(complete FileChunkComplete)
+	onConnEstablished   func(ip string)
 }
 
 func NewConnectionManager(hostname string) *ConnectionManager {
@@ -144,11 +171,9 @@ func (s *DeviceStore) Scan(hostname string) bool {
 		mac := getMACForIP(ip)
 		seen[ip] = true
 
-		// ИСПРАВЛЕНО: Используем IP как первичный ключ
 		found := false
 		for i := range s.Devices {
 			if s.Devices[i].IP == ip {
-				// Устройство уже есть, обновляем только если изменилось
 				if s.Devices[i].Name != name || s.Devices[i].MAC != mac {
 					s.Devices[i].Name = name
 					s.Devices[i].MAC = mac
@@ -160,13 +185,11 @@ func (s *DeviceStore) Scan(hostname string) bool {
 		}
 
 		if !found {
-			// Новое устройство
 			s.Devices = append(s.Devices, Device{Name: name, IP: ip, MAC: mac})
 			changed = true
 		}
 	}
 
-	// Remove devices that are no longer visible
 	filtered := s.Devices[:0]
 	for _, dev := range s.Devices {
 		if seen[dev.IP] {
@@ -213,7 +236,6 @@ func (c *ConnectionManager) listenTCP() {
 			continue
 		}
 
-		// Enable TCP keepalive
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			tcpConn.SetKeepAlive(true)
 			tcpConn.SetKeepAlivePeriod(30 * time.Second)
@@ -224,7 +246,6 @@ func (c *ConnectionManager) listenTCP() {
 }
 
 func (c *ConnectionManager) handleIncomingConnection(conn net.Conn) {
-	// Read first message to determine what type of connection this is
 	buf := make([]byte, 4096)
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	n, err := conn.Read(buf)
@@ -232,7 +253,7 @@ func (c *ConnectionManager) handleIncomingConnection(conn net.Conn) {
 		conn.Close()
 		return
 	}
-	conn.SetReadDeadline(time.Time{}) // Clear deadline
+	conn.SetReadDeadline(time.Time{})
 
 	var msg Message
 	if err := json.Unmarshal(buf[:n], &msg); err != nil {
@@ -247,7 +268,7 @@ func (c *ConnectionManager) handleIncomingConnection(conn net.Conn) {
 		if c.OnRequest != nil {
 			c.OnRequest(req)
 		}
-		conn.Close() // Close this connection
+		conn.Close()
 
 	case MsgTypeResponse:
 		var resp ConnectionResponse
@@ -255,10 +276,9 @@ func (c *ConnectionManager) handleIncomingConnection(conn net.Conn) {
 		if c.OnResult != nil {
 			c.OnResult(resp)
 		}
-		conn.Close() // Close this connection
+		conn.Close()
 
 	default:
-		// ИСПРАВЛЕНО: Это персистентное соединение от инициатора
 		remoteIP := strings.Split(conn.RemoteAddr().String(), ":")[0]
 		fmt.Printf("[DEBUG] Accepting persistent connection from %s\n", remoteIP)
 		c.establishConnection(remoteIP, "", conn, false)
@@ -267,20 +287,14 @@ func (c *ConnectionManager) handleIncomingConnection(conn net.Conn) {
 
 // ---------- CONNECTION ESTABLISHMENT ----------
 func (c *ConnectionManager) SendRequest(req ConnectionRequest) error {
-	msg := Message{
-		Type: MsgTypeRequest,
-	}
+	msg := Message{Type: MsgTypeRequest}
 	msg.Data, _ = json.Marshal(req)
-
 	return c.sendOneTimeMessage(req.ToIP, msg)
 }
 
 func (c *ConnectionManager) SendResponse(resp ConnectionResponse) error {
-	msg := Message{
-		Type: MsgTypeResponse,
-	}
+	msg := Message{Type: MsgTypeResponse}
 	msg.Data, _ = json.Marshal(resp)
-
 	return c.sendOneTimeMessage(resp.ToIP, msg)
 }
 
@@ -296,18 +310,14 @@ func (c *ConnectionManager) sendOneTimeMessage(ip string, msg Message) error {
 	return err
 }
 
-// ИСПРАВЛЕНО: Только инициатор вызывает Connect
 func (c *ConnectionManager) Connect(ip, name string) error {
-	// Небольшая задержка чтобы избежать race condition
 	time.Sleep(100 * time.Millisecond)
 
-	// Initiate persistent connection
 	conn, err := c.dialTCP(ip)
 	if err != nil {
 		return fmt.Errorf("connect dial error: %w", err)
 	}
 
-	// Enable TCP keepalive
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
@@ -320,7 +330,6 @@ func (c *ConnectionManager) Connect(ip, name string) error {
 func (c *ConnectionManager) establishConnection(ip, name string, conn net.Conn, isHub bool) error {
 	c.mu.Lock()
 
-	// Check if already connected
 	if _, exists := c.connections[ip]; exists {
 		c.mu.Unlock()
 		conn.Close()
@@ -334,8 +343,8 @@ func (c *ConnectionManager) establishConnection(ip, name string, conn net.Conn, 
 		name:          name,
 		isHub:         isHub,
 		lastHeartbeat: time.Now(),
-		readChan:      make(chan Message, 10),
-		writeChan:     make(chan Message, 10),
+		readChan:      make(chan Message, 100),
+		writeChan:     make(chan Message, 100),
 		closeChan:     make(chan struct{}),
 	}
 
@@ -344,7 +353,6 @@ func (c *ConnectionManager) establishConnection(ip, name string, conn net.Conn, 
 
 	fmt.Printf("[DEBUG] Connection established with %s (isHub=%v)\n", ip, isHub)
 
-	// Start goroutines for this connection
 	go c.readLoop(state)
 	go c.writeLoop(state)
 	go c.heartbeatLoop(state)
@@ -357,10 +365,13 @@ func (c *ConnectionManager) establishConnection(ip, name string, conn net.Conn, 
 }
 
 // ---------- CONNECTION LOOPS ----------
+// FIXED: Use json.Decoder to properly handle streaming JSON
 func (c *ConnectionManager) readLoop(state *ConnectionState) {
 	defer c.handleConnectionClose(state)
 
-	buf := make([]byte, 65536)
+	// Use JSON decoder for proper streaming
+	dec := json.NewDecoder(state.conn)
+
 	for {
 		select {
 		case <-state.closeChan:
@@ -369,15 +380,11 @@ func (c *ConnectionManager) readLoop(state *ConnectionState) {
 		}
 
 		state.conn.SetReadDeadline(time.Now().Add(connectionTimeout))
-		n, err := state.conn.Read(buf)
-		if err != nil {
-			fmt.Printf("[DEBUG] Read error from %s: %v\n", state.ip, err)
-			return
-		}
 
 		var msg Message
-		if err := json.Unmarshal(buf[:n], &msg); err != nil {
-			continue
+		if err := dec.Decode(&msg); err != nil {
+			fmt.Printf("[DEBUG] Read/decode error from %s: %v\n", state.ip, err)
+			return
 		}
 
 		c.handleMessage(state, msg)
@@ -385,18 +392,16 @@ func (c *ConnectionManager) readLoop(state *ConnectionState) {
 }
 
 func (c *ConnectionManager) writeLoop(state *ConnectionState) {
+	// Use JSON encoder for proper streaming
+	enc := json.NewEncoder(state.conn)
+
 	for {
 		select {
 		case <-state.closeChan:
 			return
 		case msg := <-state.writeChan:
-			data, err := json.Marshal(msg)
-			if err != nil {
-				continue
-			}
-
 			state.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if _, err := state.conn.Write(data); err != nil {
+			if err := enc.Encode(&msg); err != nil {
 				fmt.Printf("[DEBUG] Write error to %s: %v\n", state.ip, err)
 				return
 			}
@@ -413,7 +418,6 @@ func (c *ConnectionManager) heartbeatLoop(state *ConnectionState) {
 		case <-state.closeChan:
 			return
 		case <-ticker.C:
-			// Send heartbeat
 			hb := HeartbeatMessage{
 				FromIP:    c.LocalIP,
 				Timestamp: time.Now(),
@@ -427,7 +431,6 @@ func (c *ConnectionManager) heartbeatLoop(state *ConnectionState) {
 				return
 			}
 
-			// Check if we received heartbeat recently
 			state.mu.RLock()
 			lastHB := state.lastHeartbeat
 			state.mu.RUnlock()
@@ -443,7 +446,6 @@ func (c *ConnectionManager) heartbeatLoop(state *ConnectionState) {
 func (c *ConnectionManager) handleMessage(state *ConnectionState, msg Message) {
 	switch msg.Type {
 	case MsgTypeHeartbeat:
-		// Respond with heartbeat ack
 		ack := Message{Type: MsgTypeHeartbeatAck}
 		select {
 		case state.writeChan <- ack:
@@ -451,7 +453,6 @@ func (c *ConnectionManager) handleMessage(state *ConnectionState, msg Message) {
 		}
 
 	case MsgTypeHeartbeatAck:
-		// Update last heartbeat time
 		state.mu.Lock()
 		state.lastHeartbeat = time.Now()
 		state.mu.Unlock()
@@ -461,6 +462,30 @@ func (c *ConnectionManager) handleMessage(state *ConnectionState, msg Message) {
 		if err := json.Unmarshal(msg.Data, &clipData); err == nil {
 			if c.OnClipboard != nil {
 				c.OnClipboard(clipData)
+			}
+		}
+
+	case MsgTypeFileChunkStart:
+		var start FileChunkStart
+		if err := json.Unmarshal(msg.Data, &start); err == nil {
+			if c.OnFileChunkStart != nil {
+				c.OnFileChunkStart(start)
+			}
+		}
+
+	case MsgTypeFileChunkData:
+		var chunk FileChunkData
+		if err := json.Unmarshal(msg.Data, &chunk); err == nil {
+			if c.OnFileChunkData != nil {
+				c.OnFileChunkData(chunk)
+			}
+		}
+
+	case MsgTypeFileChunkComplete:
+		var complete FileChunkComplete
+		if err := json.Unmarshal(msg.Data, &complete); err == nil {
+			if c.OnFileChunkComplete != nil {
+				c.OnFileChunkComplete(complete)
 			}
 		}
 
@@ -503,7 +528,6 @@ func (c *ConnectionManager) Disconnect(ip string) error {
 		return fmt.Errorf("not connected to %s", ip)
 	}
 
-	// Send disconnect message
 	discMsg := DisconnectMessage{
 		FromIP: c.LocalIP,
 		Reason: "User disconnected",
@@ -570,6 +594,106 @@ func (c *ConnectionManager) BroadcastClipboard(content string) {
 		case <-time.After(500 * time.Millisecond):
 			fmt.Printf("Failed to send clipboard to %s\n", state.ip)
 		}
+	}
+}
+
+// ---------- FILE TRANSFER WITH CHUNKING ----------
+func (c *ConnectionManager) BroadcastFileClipboard(fileName string, fileData []byte, checksum string) {
+	fileID := fmt.Sprintf("%s_%d", fileName, time.Now().Unix())
+	fileSize := int64(len(fileData))
+	totalChunks := (len(fileData) + FileChunkSize - 1) / FileChunkSize
+
+	fmt.Printf("[NET] Broadcasting file %s in %d chunks (%d KB)\n", fileName, totalChunks, fileSize/1024)
+
+	c.mu.RLock()
+	connections := make([]*ConnectionState, 0, len(c.connections))
+	for _, state := range c.connections {
+		connections = append(connections, state)
+	}
+	c.mu.RUnlock()
+
+	// FIXED: Use WaitGroup to ensure all sends complete
+	var wg sync.WaitGroup
+	for _, state := range connections {
+		wg.Add(1)
+		go func(st *ConnectionState) {
+			defer wg.Done()
+			c.sendFileToConnection(st, fileID, fileName, fileData, fileSize, totalChunks, checksum)
+		}(state)
+	}
+	wg.Wait()
+	fmt.Printf("[NET] All file transfers initiated\n")
+}
+
+func (c *ConnectionManager) sendFileToConnection(state *ConnectionState, fileID, fileName string,
+	fileData []byte, fileSize int64, totalChunks int, checksum string) {
+
+	// 1. Send start message
+	start := FileChunkStart{
+		FileID:      fileID,
+		FileName:    fileName,
+		TotalSize:   fileSize,
+		TotalChunks: totalChunks,
+		Checksum:    checksum,
+		FromIP:      c.LocalIP,
+	}
+
+	msg := Message{Type: MsgTypeFileChunkStart}
+	msg.Data, _ = json.Marshal(start)
+
+	select {
+	case state.writeChan <- msg:
+	case <-time.After(5 * time.Second):
+		fmt.Printf("[NET] Failed to send file start to %s\n", state.ip)
+		return
+	}
+
+	fmt.Printf("[NET] Sending file %s to %s in %d chunks\n", fileName, state.ip, totalChunks)
+
+	// 2. Send chunks
+	for i := 0; i < totalChunks; i++ {
+		startIdx := i * FileChunkSize
+		endIdx := startIdx + FileChunkSize
+		if endIdx > len(fileData) {
+			endIdx = len(fileData)
+		}
+
+		chunkData := FileChunkData{
+			FileID:     fileID,
+			ChunkIndex: i,
+			Data:       fileData[startIdx:endIdx],
+		}
+
+		msg := Message{Type: MsgTypeFileChunkData}
+		msg.Data, _ = json.Marshal(chunkData)
+
+		select {
+		case state.writeChan <- msg:
+			// No delay for maximum speed
+		case <-time.After(10 * time.Second):
+			fmt.Printf("[NET] Failed to send chunk %d/%d to %s\n", i+1, totalChunks, state.ip)
+			return
+		}
+
+		if (i+1)%10 == 0 || i == totalChunks-1 {
+			fmt.Printf("[NET] Sent chunk %d/%d to %s\n", i+1, totalChunks, state.ip)
+		}
+	}
+
+	// 3. Send complete message
+	complete := FileChunkComplete{
+		FileID:   fileID,
+		Checksum: checksum,
+	}
+
+	msg = Message{Type: MsgTypeFileChunkComplete}
+	msg.Data, _ = json.Marshal(complete)
+
+	select {
+	case state.writeChan <- msg:
+		fmt.Printf("[NET] File %s sent successfully to %s\n", fileName, state.ip)
+	case <-time.After(5 * time.Second):
+		fmt.Printf("[NET] Failed to send file complete to %s\n", state.ip)
 	}
 }
 
