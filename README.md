@@ -2,9 +2,14 @@
 
 > **Seamless clipboard and file sharing across Windows devices on your local network** 🚀
 
-[![Windows](https://img.shields.io/badge/platform-Windows-0078D6?style=flat-square&logo=windows)](https://www.microsoft.com/windows)
+[![Version](https://img.shields.io/github/v/release/Krasnovvvvv/share-my-clipboard?style=flat-square&color=orange)](https://github.com/Krasnovvvvv/share-my-clipboard/releases)
 [![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat-square&logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-available-blue?style=flat-square)](./docs)
+
+[![Windows](https://img.shields.io/badge/platform-Windows-0078D6?style=flat-square&logo=windows)](https://www.microsoft.com/windows)
+[![Windows Build](https://github.com/Krasnovvvvv/share-my-clipboard/actions/workflows/go-build.yml/badge.svg?branch=main)](https://github.com/Krasnovvvvv/share-my-clipboard/actions/workflows/go-build.yml)
+
 
 Share My Clipboard is a powerful, user-friendly desktop application that enables instant clipboard synchronization and file transfers between Windows computers on the same network — no cloud, no internet required! 🌐
 
@@ -190,7 +195,7 @@ Please open issues or pull requests on the GitHub repository
 
 ## 📝 License
 
-This project is licensed under the MIT License - see [LICENSE](LICENSE) file for details
+This project is licensed under the MIT License - see [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE) file for details
 
 ---
 
