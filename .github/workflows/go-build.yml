@@ -61,11 +61,14 @@ jobs:
         SIGN_PASS: ${{ secrets.WIN_SIGN_PASS }}
       run: |
         Write-Host "Signing executables..."
-        New-Item -Path "$env:USERPROFILE\\cert.pfx" -ItemType File -Force | Out-Null
-        [System.Convert]::FromBase64String($env:SIGN_CERT) | Set-Content -Encoding Byte "$env:USERPROFILE\\cert.pfx"
-        signtool sign /f "$env:USERPROFILE\\cert.pfx" /p "$env:SIGN_PASS" /tr http://timestamp.digicert.com /td SHA256 /fd SHA256 share-my-clipboard.exe
-        signtool sign /f "$env:USERPROFILE\\cert.pfx" /p "$env:SIGN_PASS" /tr http://timestamp.digicert.com /td SHA256 /fd SHA256 share-my-clipboard-debug.exe
-        Write-Host "✅ Signing completed!"
+        $certPath = "$env:USERPROFILE\\cert.pfx"
+        [System.Convert]::FromBase64String($env:SIGN_CERT) | ForEach-Object { [byte]$_ } | Set-Content -Path $certPath -AsByteStream
+
+        $timestamp = "http://timestamp.digicert.com"
+        & $env:signtool_path sign /f $certPath /p $env:SIGN_PASS /tr $timestamp /td SHA256 /fd SHA256 share-my-clipboard.exe
+        & $env:signtool_path sign /f $certPath /p $env:SIGN_PASS /tr $timestamp /td SHA256 /fd SHA256 share-my-clipboard-debug.exe
+        Write-Host "✅ Signing completed successfully!"
+
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
