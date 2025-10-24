@@ -29,10 +29,9 @@ jobs:
     - name: Generate resources for RELEASE build
       run: |
         cd internal/ui
-        $env:GO111MODULE="on"
-        go run github.com/akavel/rsrc@latest -ico:Icons/app.ico -o app.syso
+        go run github.com/akavel/rsrc@latest -ico Icons/main_icon.ico -o app.syso
         cd ../..
-    
+
     - name: Build GUI App (no console)
       run: |
         go build -ldflags="-H=windowsgui -s -w -X 'main.appName=Share my clipboard'" -o "Share my clipboard.exe"
@@ -40,10 +39,9 @@ jobs:
     - name: Generate resources for DEBUG build
       run: |
         cd internal/ui
-        $env:GO111MODULE="on"
-        go run github.com/akavel/rsrc@latest -ico:Icons/app.ico -o app.syso
+        go run github.com/akavel/rsrc@latest -ico Icons/main_icon.ico -o app.syso
         cd ../..
-    
+
     - name: Build Debug App (with console)
       run: |
         go build -ldflags="-s -w -X 'main.appName=Share my clipboard (debug)'" -o "Share my clipboard (debug).exe"
