@@ -66,7 +66,7 @@ Share My Clipboard is a powerful, user-friendly desktop application that enables
 ### Installation
 
 1. **Download** the latest release from [Releases](https://github.com/Krasnovvvvv/share-my-clipboard/releases)
-2. **Extract** `share-my-clipboard.exe` to any folder
+2. **Extract** `Share.My.Clipboard.exe` to any folder
 3. **Run** the executable — GUI will open automatically
 
 ### First Use
