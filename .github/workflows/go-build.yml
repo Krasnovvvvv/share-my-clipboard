@@ -23,11 +23,30 @@ jobs:
     - name: Download Go dependencies
       run: go mod download
 
-    - name: Build GUI App (no console)
-      run: go build -ldflags="-H=windowsgui -s -w" -o share-my-clipboard.exe
+    - name: Install rsrc tool
+      run: go install github.com/akavel/rsrc@latest
 
+    - name: Generate resources for RELEASE build
+      run: |
+        cd internal/ui
+        $env:GO111MODULE="on"
+        go run github.com/akavel/rsrc@latest -ico:Icons/app.ico -o app.syso
+        cd ../..
+    
+    - name: Build GUI App (no console)
+      run: |
+        go build -ldflags="-H=windowsgui -s -w -X 'main.appName=Share my clipboard'" -o "Share my clipboard.exe"
+
+    - name: Generate resources for DEBUG build
+      run: |
+        cd internal/ui
+        $env:GO111MODULE="on"
+        go run github.com/akavel/rsrc@latest -ico:Icons/app.ico -o app.syso
+        cd ../..
+    
     - name: Build Debug App (with console)
-      run: go build -ldflags="-s -w" -o share-my-clipboard-debug.exe
+      run: |
+        go build -ldflags="-s -w -X 'main.appName=Share my clipboard (debug)'" -o "Share my clipboard (debug).exe"
 
     - name: Run Tests
       run: go test -v ./...
@@ -48,8 +67,8 @@ jobs:
         Where-Object { $_.Name -eq "signtool.exe" } |
         Select-Object -First 1 -ExpandProperty FullName
         if (!$signtool) {
-        Write-Error "❌ SignTool not found in system paths!"
-        exit 1
+          Write-Error "❌ SignTool not found in system paths!"
+          exit 1
         }
         Write-Host "✅ Found SignTool at: $signtool"
         echo "signtool_path=$signtool" | Out-File -Append -FilePath $env:GITHUB_ENV
@@ -63,17 +82,15 @@ jobs:
         Write-Host "Signing executables..."
         $certPath = "$env:USERPROFILE\\cert.pfx"
         [System.Convert]::FromBase64String($env:SIGN_CERT) | ForEach-Object { [byte]$_ } | Set-Content -Path $certPath -AsByteStream
-
         $timestamp = "http://timestamp.digicert.com"
-        & $env:signtool_path sign /f $certPath /p $env:SIGN_PASS /tr $timestamp /td SHA256 /fd SHA256 share-my-clipboard.exe
-        & $env:signtool_path sign /f $certPath /p $env:SIGN_PASS /tr $timestamp /td SHA256 /fd SHA256 share-my-clipboard-debug.exe
+        & $env:signtool_path sign /f $certPath /p $env:SIGN_PASS /tr $timestamp /td SHA256 /fd SHA256 "Share my clipboard.exe"
+        & $env:signtool_path sign /f $certPath /p $env:SIGN_PASS /tr $timestamp /td SHA256 /fd SHA256 "Share my clipboard (debug).exe"
         Write-Host "✅ Signing completed successfully!"
-
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
         name: signed-windows-builds
         path: |
-          share-my-clipboard.exe
-          share-my-clipboard-debug.exe
+          Share my clipboard.exe
+          Share my clipboard (debug).exe
